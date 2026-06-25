@@ -2,21 +2,27 @@
 // ==========================================================
 // SECJ3483 Web Technology
 // Person BMI Secure Backend
-// Commit 2: Backend validation, password hashing, prepared statements
+// Commit 3: JWT authentication and protected routes
 // ==========================================================
 
 use Psr\Http\Message\ResponseInterface as Response;
 use Psr\Http\Message\ServerRequestInterface as Request;
 use Slim\Factory\AppFactory;
+use Firebase\JWT\JWT;
+use Firebase\JWT\Key;
 
 require __DIR__ . '/../vendor/autoload.php';
 require __DIR__ . '/../src/db.php';
 
+$config = require __DIR__ . '/../src/config.php';
+
+define('JWT_SECRET', $config['jwt_secret']);
+define('JWT_EXPIRY', $config['jwt_expiry']);
+
 $app = AppFactory::create();
 $app->addBodyParsingMiddleware();
 
-// FIX 12: Disable detailed error display to users
-$app->addErrorMiddleware(false, true, true);
+$app->addErrorMiddleware(false, false, false);
 
 // ----------------------------------------------------------
 // CORS
@@ -73,8 +79,7 @@ function getBmiCategory(float $bmi): string
 // FIX 12: Safe error handler - never expose internal errors to users
 function safeError(Response $response, Throwable $e, int $status = 500): Response
 {
-    error_log($e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
-    return jsonResponse($response, ['error' => 'Unable to process request'], $status);
+    return jsonResponse($response, ['error' => 'An unexpected error occurred'], $status);
 }
 
 // FIX 1: Backend validation for BMI input fields
@@ -95,25 +100,36 @@ function validateBmiData(array $data): ?string
     return null;
 }
 
-// Note: Still using fake token - will be replaced with real JWT in Commit 3
-function createFakeToken(array $user): string
+// FIX 5: Real signed JWT with expiry
+// Payload contains user_id, role, email, iat, exp - no passwords
+function createJwt(array $user): string
 {
     $payload = [
         'user_id' => $user['id'],
         'role'    => $user['role'],
-        'email'   => $user['email']
+        'email'   => $user['email'],
+        'iat'     => time(),
+        'exp'     => time() + JWT_EXPIRY
     ];
-    return base64_encode(json_encode($payload));
+
+    return JWT::encode($payload, JWT_SECRET, 'HS256');
 }
 
-function getFakeUserFromToken(Request $request): ?array
+// FIX 6: Verify JWT signature and expiry - reject invalid or expired tokens
+function verifyJwt(Request $request): ?object
 {
     $auth = $request->getHeaderLine('Authorization');
-    if (!$auth || !preg_match('/Bearer\s+(\S+)/', $auth, $matches)) return null;
-    $json = base64_decode($matches[1], true);
-    if (!$json) return null;
-    $payload = json_decode($json, true);
-    return is_array($payload) ? $payload : null;
+
+    if (!$auth || !preg_match('/Bearer\s+(\S+)/', $auth, $matches)) {
+        return null;
+    }
+
+    try {
+        $decoded = JWT::decode($matches[1], new Key(JWT_SECRET, 'HS256'));
+        return $decoded;
+    } catch (Throwable $e) {
+        return null;
+    }
 }
 
 // ----------------------------------------------------------
@@ -122,7 +138,7 @@ function getFakeUserFromToken(Request $request): ?array
 $app->get('/', function (Request $request, Response $response) {
     return jsonResponse($response, [
         'message' => 'Person BMI Secure Backend',
-        'commit'  => '2 - validation, password hashing, prepared statements'
+        'commit'  => '3 - JWT authentication and protected routes'
     ]);
 });
 
@@ -200,7 +216,8 @@ $app->post('/api/login', function (Request $request, Response $response) {
             return jsonResponse($response, ['error' => 'Invalid email or password'], 401);
         }
 
-        $token = createFakeToken($user);
+        // FIX 5: Issue real signed JWT
+        $token = createJwt($user);
 
         // FIX 10: Return only safe user fields
         return jsonResponse($response, [
@@ -226,13 +243,13 @@ $app->post('/api/login', function (Request $request, Response $response) {
 $app->get('/api/profile', function (Request $request, Response $response) {
     try {
         $pdo      = getPDO();
-        $fakeUser = getFakeUserFromToken($request);
+        $decoded = verifyJwt($request);
 
-        if (!$fakeUser) {
+        if (!$decoded) {
             return jsonResponse($response, ['error' => 'Unauthorized'], 401);
         }
 
-        $userId = $fakeUser['user_id'];
+        $userId = $decoded->user_id;
 
         // FIX 4 + FIX 10: Prepared statement, safe fields only
         $stmt = $pdo->prepare("SELECT id, name, email, role, created_at FROM users WHERE id = ?");
@@ -255,13 +272,13 @@ $app->get('/api/profile', function (Request $request, Response $response) {
 $app->get('/api/persons', function (Request $request, Response $response) {
     try {
         $pdo      = getPDO();
-        $fakeUser = getFakeUserFromToken($request);
+        $decoded = verifyJwt($request);
 
-        if (!$fakeUser) {
+        if (!$decoded) {
             return jsonResponse($response, ['error' => 'Unauthorized'], 401);
         }
 
-        $userId = $fakeUser['user_id'];
+        $userId = $decoded->user_id;
 
         $stmt = $pdo->prepare(
             "SELECT id, user_id, name, age, height, weight, bmi, category, notes, created_at
@@ -285,9 +302,9 @@ $app->post('/api/persons', function (Request $request, Response $response) {
     try {
         $pdo      = getPDO();
         $data     = getRequestData($request);
-        $fakeUser = getFakeUserFromToken($request);
+        $decoded = verifyJwt($request);
 
-        if (!$fakeUser) {
+        if (!$decoded) {
             return jsonResponse($response, ['error' => 'Unauthorized'], 401);
         }
 
@@ -308,7 +325,7 @@ $app->post('/api/persons', function (Request $request, Response $response) {
         $category = getBmiCategory($bmi);
 
         // FIX 9: user_id from verified token, not from request body
-        $userId = $fakeUser['user_id'];
+        $userId = $decoded->user_id;
 
         // FIX 4: Prepared statement
         $stmt = $pdo->prepare(
@@ -337,9 +354,9 @@ $app->get('/api/persons/{id}', function (Request $request, Response $response, a
     try {
         $pdo      = getPDO();
         $id       = (int) $args['id'];
-        $fakeUser = getFakeUserFromToken($request);
+        $decoded = verifyJwt($request);
 
-        if (!$fakeUser) {
+        if (!$decoded) {
             return jsonResponse($response, ['error' => 'Unauthorized'], 401);
         }
 
@@ -370,9 +387,9 @@ $app->put('/api/persons/{id}', function (Request $request, Response $response, a
         $pdo      = getPDO();
         $id       = (int) $args['id'];
         $data     = getRequestData($request);
-        $fakeUser = getFakeUserFromToken($request);
+        $decoded = verifyJwt($request);
 
-        if (!$fakeUser) {
+        if (!$decoded) {
             return jsonResponse($response, ['error' => 'Unauthorized'], 401);
         }
 
@@ -419,9 +436,9 @@ $app->delete('/api/persons/{id}', function (Request $request, Response $response
     try {
         $pdo      = getPDO();
         $id       = (int) $args['id'];
-        $fakeUser = getFakeUserFromToken($request);
+        $decoded = verifyJwt($request);
 
-        if (!$fakeUser) {
+        if (!$decoded) {
             return jsonResponse($response, ['error' => 'Unauthorized'], 401);
         }
 
@@ -443,9 +460,9 @@ $app->delete('/api/persons/{id}', function (Request $request, Response $response
 $app->get('/api/staff/persons', function (Request $request, Response $response) {
     try {
         $pdo      = getPDO();
-        $fakeUser = getFakeUserFromToken($request);
+        $decoded = verifyJwt($request);
 
-        if (!$fakeUser) {
+        if (!$decoded) {
             return jsonResponse($response, ['error' => 'Unauthorized'], 401);
         }
 
@@ -470,9 +487,9 @@ $app->get('/api/staff/persons/{id}', function (Request $request, Response $respo
     try {
         $pdo      = getPDO();
         $id       = (int) $args['id'];
-        $fakeUser = getFakeUserFromToken($request);
+        $decoded = verifyJwt($request);
 
-        if (!$fakeUser) {
+        if (!$decoded) {
             return jsonResponse($response, ['error' => 'Unauthorized'], 401);
         }
 
@@ -506,9 +523,9 @@ $app->get('/api/staff/persons/{id}', function (Request $request, Response $respo
 $app->get('/api/admin/users', function (Request $request, Response $response) {
     try {
         $pdo      = getPDO();
-        $fakeUser = getFakeUserFromToken($request);
+        $decoded = verifyJwt($request);
 
-        if (!$fakeUser) {
+        if (!$decoded) {
             return jsonResponse($response, ['error' => 'Unauthorized'], 401);
         }
 
@@ -528,9 +545,9 @@ $app->put('/api/admin/users/{id}/role', function (Request $request, Response $re
         $pdo      = getPDO();
         $id       = (int) $args['id'];
         $data     = getRequestData($request);
-        $fakeUser = getFakeUserFromToken($request);
+        $decoded = verifyJwt($request);
 
-        if (!$fakeUser) {
+        if (!$decoded) {
             return jsonResponse($response, ['error' => 'Unauthorized'], 401);
         }
 
@@ -558,9 +575,9 @@ $app->delete('/api/admin/persons/{id}', function (Request $request, Response $re
     try {
         $pdo      = getPDO();
         $id       = (int) $args['id'];
-        $fakeUser = getFakeUserFromToken($request);
+        $decoded = verifyJwt($request);
 
-        if (!$fakeUser) {
+        if (!$decoded) {
             return jsonResponse($response, ['error' => 'Unauthorized'], 401);
         }
 
@@ -569,36 +586,6 @@ $app->delete('/api/admin/persons/{id}', function (Request $request, Response $re
         $stmt->execute([$id]);
 
         return jsonResponse($response, ['message' => 'BMI record deleted']);
-    } catch (Throwable $e) {
-        return safeError($response, $e);
-    }
-});
-
-// ----------------------------------------------------------
-// Migration endpoint - run ONCE to hash existing plain text passwords
-// Visit: http://localhost:8080/api/migrate-passwords
-// Remove this route after running
-// ----------------------------------------------------------
-$app->get('/api/migrate-passwords', function (Request $request, Response $response) {
-    try {
-        $pdo   = getPDO();
-        $stmt  = $pdo->query("SELECT id, password, password_hash FROM users");
-        $users = $stmt->fetchAll();
-        $count = 0;
-
-        foreach ($users as $user) {
-            // Only migrate if password_hash is not already a bcrypt hash
-            if (substr($user['password_hash'] ?? '', 0, 4) !== '$2y$') {
-                $hash   = password_hash($user['password'], PASSWORD_DEFAULT);
-                $update = $pdo->prepare("UPDATE users SET password_hash = ? WHERE id = ?");
-                $update->execute([$hash, $user['id']]);
-                $count++;
-            }
-        }
-
-        return jsonResponse($response, [
-            'message' => "Successfully migrated $count user passwords to bcrypt hash"
-        ]);
     } catch (Throwable $e) {
         return safeError($response, $e);
     }
