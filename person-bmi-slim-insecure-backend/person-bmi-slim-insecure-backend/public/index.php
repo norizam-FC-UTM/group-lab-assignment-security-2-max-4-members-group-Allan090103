@@ -2,7 +2,7 @@
 // ==========================================================
 // SECJ3483 Web Technology
 // Person BMI Secure Backend
-// Commit 3: JWT authentication and protected routes
+// Commit 4: RBAC, owner-based access control, and XSS fix
 // ==========================================================
 
 use Psr\Http\Message\ResponseInterface as Response;
@@ -350,10 +350,11 @@ $app->post('/api/persons', function (Request $request, Response $response) {
 
 // GET /api/persons/{id}
 // FIX 4: Prepared statement
+// FIX 7: Owner-based access control - owner, staff, or admin only
 $app->get('/api/persons/{id}', function (Request $request, Response $response, array $args) {
     try {
-        $pdo      = getPDO();
-        $id       = (int) $args['id'];
+        $pdo     = getPDO();
+        $id      = (int) $args['id'];
         $decoded = verifyJwt($request);
 
         if (!$decoded) {
@@ -371,6 +372,11 @@ $app->get('/api/persons/{id}', function (Request $request, Response $response, a
             return jsonResponse($response, ['error' => 'Record not found'], 404);
         }
 
+        // FIX 7: Only owner, staff, or admin may view this record
+        if ($decoded->user_id != $person['user_id'] && !in_array($decoded->role, ['staff', 'admin'])) {
+            return jsonResponse($response, ['error' => 'Access denied'], 403);
+        }
+
         return jsonResponse($response, ['person' => $person]);
     } catch (Throwable $e) {
         return safeError($response, $e);
@@ -381,16 +387,31 @@ $app->get('/api/persons/{id}', function (Request $request, Response $response, a
 // FIX 1: Backend validation
 // FIX 2: Backend BMI recalculation
 // FIX 4: Prepared statement
+// FIX 7: Owner or admin only
 // FIX 9: Only allowed fields updated - user_id, role, bmi, category blocked
 $app->put('/api/persons/{id}', function (Request $request, Response $response, array $args) {
     try {
-        $pdo      = getPDO();
-        $id       = (int) $args['id'];
-        $data     = getRequestData($request);
+        $pdo     = getPDO();
+        $id      = (int) $args['id'];
+        $data    = getRequestData($request);
         $decoded = verifyJwt($request);
 
         if (!$decoded) {
             return jsonResponse($response, ['error' => 'Unauthorized'], 401);
+        }
+
+        // FIX 7: Fetch record first to check ownership
+        $stmt = $pdo->prepare("SELECT user_id FROM persons WHERE id = ?");
+        $stmt->execute([$id]);
+        $person = $stmt->fetch();
+
+        if (!$person) {
+            return jsonResponse($response, ['error' => 'Record not found'], 404);
+        }
+
+        // FIX 7: Only owner or admin may update
+        if ($decoded->user_id != $person['user_id'] && $decoded->role !== 'admin') {
+            return jsonResponse($response, ['error' => 'Access denied'], 403);
         }
 
         // FIX 1: Validate input
@@ -432,14 +453,29 @@ $app->put('/api/persons/{id}', function (Request $request, Response $response, a
 
 // DELETE /api/persons/{id}
 // FIX 4: Prepared statement
+// FIX 7: Owner or admin only
 $app->delete('/api/persons/{id}', function (Request $request, Response $response, array $args) {
     try {
-        $pdo      = getPDO();
-        $id       = (int) $args['id'];
+        $pdo     = getPDO();
+        $id      = (int) $args['id'];
         $decoded = verifyJwt($request);
 
         if (!$decoded) {
             return jsonResponse($response, ['error' => 'Unauthorized'], 401);
+        }
+
+        // FIX 7: Fetch record first to check ownership
+        $stmt = $pdo->prepare("SELECT user_id FROM persons WHERE id = ?");
+        $stmt->execute([$id]);
+        $person = $stmt->fetch();
+
+        if (!$person) {
+            return jsonResponse($response, ['error' => 'Record not found'], 404);
+        }
+
+        // FIX 7: Only owner or admin may delete
+        if ($decoded->user_id != $person['user_id'] && $decoded->role !== 'admin') {
+            return jsonResponse($response, ['error' => 'Access denied'], 403);
         }
 
         $stmt = $pdo->prepare("DELETE FROM persons WHERE id = ?");
@@ -454,16 +490,21 @@ $app->delete('/api/persons/{id}', function (Request $request, Response $response
 // ----------------------------------------------------------
 // Staff routes
 // FIX 4: Prepared statements
+// FIX 8: Role-based access control - staff or admin only
 // FIX 10: Safe fields only (no password exposed)
-// Note: Role check added in Commit 3
 // ----------------------------------------------------------
 $app->get('/api/staff/persons', function (Request $request, Response $response) {
     try {
-        $pdo      = getPDO();
+        $pdo     = getPDO();
         $decoded = verifyJwt($request);
 
         if (!$decoded) {
             return jsonResponse($response, ['error' => 'Unauthorized'], 401);
+        }
+
+        // FIX 8: Only staff or admin may access staff routes
+        if (!in_array($decoded->role, ['staff', 'admin'])) {
+            return jsonResponse($response, ['error' => 'Staff access required'], 403);
         }
 
         $stmt = $pdo->prepare(
@@ -485,12 +526,17 @@ $app->get('/api/staff/persons', function (Request $request, Response $response) 
 
 $app->get('/api/staff/persons/{id}', function (Request $request, Response $response, array $args) {
     try {
-        $pdo      = getPDO();
-        $id       = (int) $args['id'];
+        $pdo     = getPDO();
+        $id      = (int) $args['id'];
         $decoded = verifyJwt($request);
 
         if (!$decoded) {
             return jsonResponse($response, ['error' => 'Unauthorized'], 401);
+        }
+
+        // FIX 8: Only staff or admin may access staff routes
+        if (!in_array($decoded->role, ['staff', 'admin'])) {
+            return jsonResponse($response, ['error' => 'Staff access required'], 403);
         }
 
         $stmt = $pdo->prepare(
@@ -517,16 +563,21 @@ $app->get('/api/staff/persons/{id}', function (Request $request, Response $respo
 // ----------------------------------------------------------
 // Admin routes
 // FIX 4: Prepared statements
+// FIX 8: Role-based access control - admin only
 // FIX 10: No password fields returned
-// Note: Role check added in Commit 3
 // ----------------------------------------------------------
 $app->get('/api/admin/users', function (Request $request, Response $response) {
     try {
-        $pdo      = getPDO();
+        $pdo     = getPDO();
         $decoded = verifyJwt($request);
 
         if (!$decoded) {
             return jsonResponse($response, ['error' => 'Unauthorized'], 401);
+        }
+
+        // FIX 8: Only admin may access admin routes
+        if ($decoded->role !== 'admin') {
+            return jsonResponse($response, ['error' => 'Admin access required'], 403);
         }
 
         // FIX 10: Select only safe fields - no password or password_hash
@@ -542,13 +593,18 @@ $app->get('/api/admin/users', function (Request $request, Response $response) {
 
 $app->put('/api/admin/users/{id}/role', function (Request $request, Response $response, array $args) {
     try {
-        $pdo      = getPDO();
-        $id       = (int) $args['id'];
-        $data     = getRequestData($request);
+        $pdo     = getPDO();
+        $id      = (int) $args['id'];
+        $data    = getRequestData($request);
         $decoded = verifyJwt($request);
 
         if (!$decoded) {
             return jsonResponse($response, ['error' => 'Unauthorized'], 401);
+        }
+
+        // FIX 8: Only admin may change roles
+        if ($decoded->role !== 'admin') {
+            return jsonResponse($response, ['error' => 'Admin access required'], 403);
         }
 
         $role = $data['role'] ?? 'user';
@@ -573,12 +629,17 @@ $app->put('/api/admin/users/{id}/role', function (Request $request, Response $re
 
 $app->delete('/api/admin/persons/{id}', function (Request $request, Response $response, array $args) {
     try {
-        $pdo      = getPDO();
-        $id       = (int) $args['id'];
+        $pdo     = getPDO();
+        $id      = (int) $args['id'];
         $decoded = verifyJwt($request);
 
         if (!$decoded) {
             return jsonResponse($response, ['error' => 'Unauthorized'], 401);
+        }
+
+        // FIX 8: Only admin may delete any record
+        if ($decoded->role !== 'admin') {
+            return jsonResponse($response, ['error' => 'Admin access required'], 403);
         }
 
         // FIX 4: Prepared statement
